@@ -19,7 +19,7 @@ class ProfterHeaterCoordinator(DataUpdateCoordinator[Parsed]):
         self.address = entry.data[CONF_ADDRESS]
         poll = entry.data.get(CONF_POLL_INTERVAL, DEFAULT_POLL_INTERVAL)
 
-        self.ble = ProfterHeaterBLE(self.address)
+        self.ble = ProfterHeaterBLE(hass, self.address)
 
         super().__init__(
             hass,
