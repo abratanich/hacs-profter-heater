@@ -122,39 +122,40 @@ class ProfterHeaterBLE:
         assert self._client is not None
         return self._client
 
-    async def poll_status(self, timeout: float = 5.0) -> Parsed:
+    async def poll_status(self, timeout: float = 6.0) -> Parsed:
         async with self._lock:
             c = await self._ensure()
-            self._got_evt.clear()
 
-            # 1) сначала попробуем READ (у notify-char есть read)
+            # Иногда READ работает, но на практике часто нет — оставим как бонус
             try:
                 b = await c.read_gatt_char(NOTIFY_CHAR)
                 if isinstance(b, (bytes, bytearray)) and len(b) == 52:
-                    self._last.raw52 = bytes(b)
-                    self._last.is_on = parse_onoff_from_status52(self._last.raw52)
-                    self._last.room_c, self._last.heater_c = parse_temps_best_effort(self._last.raw52)
+                    b = bytes(b)
+                    self._last.raw52 = b
+                    self._last.is_on = parse_onoff_from_status52(b)
+                    self._last.room_c, self._last.heater_c = parse_temps_best_effort(b)
                     return self._last
             except Exception:
                 pass
 
-            # 2) затем 2-3 раза POLL + ожидание notify
-            for _ in range(3):
+            for attempt in range(3):
                 self._got_evt.clear()
+
                 try:
                     await c.write_gatt_char(WRITE_CHAR, POLL52, response=True)
                 except Exception:
-                    # если write упал — переподключимся
                     await self.disconnect()
                     c = await self._ensure()
                     await c.write_gatt_char(WRITE_CHAR, POLL52, response=True)
 
                 try:
-                    await asyncio.wait_for(self._got_evt.wait(), timeout=timeout / 3)
+                    await asyncio.wait_for(self._got_evt.wait(), timeout=timeout)
                     return self._last
                 except asyncio.TimeoutError:
-                    # на некоторых девайсах помогает небольшой интервал
-                    await asyncio.sleep(0.25)
+                    await asyncio.sleep(0.3)
+                except asyncio.CancelledError:
+                    # HA отменил таск — просто возвращаем то, что есть
+                    return self._last
 
             return self._last
 
