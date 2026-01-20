@@ -180,3 +180,18 @@ class ProfterHeaterBLE:
             await asyncio.sleep(0.2)
             await self._resubscribe_notify()
             return await self._poll52_once(timeout=timeout)
+
+    async def async_can_connect(_hass, address: str) -> tuple[bool, str | None]:
+        """Проверка на этапе config_flow: видим ли девайс и можем ли подключиться."""
+        try:
+            dev = await _find_device(address, timeout=6.0)
+            if not dev:
+                return False, "not_found"
+
+            async with BleakClient(dev) as c:
+                if not c.is_connected:
+                    return False, "cannot_connect"
+
+            return True, None
+        except Exception:
+            return False, "cannot_connect"
