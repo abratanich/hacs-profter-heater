@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import asyncio
 from dataclasses import dataclass
 from typing import Optional, Tuple
@@ -5,10 +7,6 @@ from typing import Optional, Tuple
 from bleak import BleakClient, BleakScanner
 
 from .const import WRITE_CHAR, NOTIFY_CHAR, CMD_ON, CMD_OFF, POLL52
-
-# (опционально) keepalive из твоего snoop — если подтвердилось, что помогает
-KEEPALIVE_A = bytes.fromhex("AA0065020A000316")
-KEEPALIVE_B = bytes.fromhex("AA006502001E1F22")
 
 
 @dataclass
@@ -20,6 +18,7 @@ class Parsed:
 
 
 def _find_sync_index(p: bytes) -> int:
+    # Ищем паттерн A5 05 ?? 1E
     for i in range(0, len(p) - 3):
         if p[i] == 0xA5 and p[i + 1] == 0x05 and p[i + 3] == 0x1E:
             return i
@@ -27,6 +26,8 @@ def _find_sync_index(p: bytes) -> int:
 
 
 def parse_onoff_from_status52(p: bytes) -> Optional[bool]:
+    # ... A5 05 ?? 1E 01 73 ... => ON
+    # ... A5 05 ?? 1E 02 EF ... => OFF
     if len(p) != 52:
         return None
     i = _find_sync_index(p)
@@ -41,6 +42,8 @@ def parse_onoff_from_status52(p: bytes) -> Optional[bool]:
 
 
 def parse_temps_best_effort(_p: bytes) -> Tuple[Optional[float], Optional[float]]:
+    # Температуры пока не подтверждены (оффсеты/тип данных).
+    # Возвращаем None, чтобы не публиковать неверные значения.
     return (None, None)
 
 
@@ -54,6 +57,19 @@ async def _find_device(address: str, timeout: float = 8.0):
     return None
 
 
+async def async_can_connect(_hass, address: str) -> tuple[bool, Optional[str]]:
+    try:
+        dev = await _find_device(address, timeout=6.0)
+        if not dev:
+            return False, "not_found"
+        async with BleakClient(dev) as c:
+            if not c.is_connected:
+                return False, "cannot_connect"
+        return True, None
+    except Exception:
+        return False, "cannot_connect"
+
+
 class ProfterHeaterBLE:
     def __init__(self, address: str):
         self._address = address
@@ -61,41 +77,35 @@ class ProfterHeaterBLE:
         self._lock = asyncio.Lock()
         self._last = Parsed()
         self._got_evt = asyncio.Event()
-        self._notify_started = False
 
     @property
     def last(self) -> Parsed:
         return self._last
 
-    def _notify_cb(self, _handle: int, data: bytearray):
-        b = bytes(data)
-        if len(b) != 52:
-            return
-        self._last.raw52 = b
-        self._last.is_on = parse_onoff_from_status52(b)
-        self._last.room_c, self._last.heater_c = parse_temps_best_effort(b)
-        self._got_evt.set()
-
     async def connect(self) -> None:
-        dev = await _find_device(self._address, timeout=12.0)
+        dev = await _find_device(self._address, timeout=10.0)
         if not dev:
             raise RuntimeError("Device not found")
-
         self._client = BleakClient(dev)
         await self._client.connect()
         if not self._client.is_connected:
             raise RuntimeError("BLE connect failed")
 
-        # важный момент: подписку держим и умеем перевключать
-        await self._client.start_notify(NOTIFY_CHAR, self._notify_cb)
-        self._notify_started = True
+        def cb(_handle: int, data: bytearray):
+            b = bytes(data)
+            if len(b) == 52:
+                self._last.raw52 = b
+                self._last.is_on = parse_onoff_from_status52(b)
+                self._last.room_c, self._last.heater_c = parse_temps_best_effort(b)
+                self._got_evt.set()
+
+        await self._client.start_notify(NOTIFY_CHAR, cb)
 
     async def disconnect(self) -> None:
         if not self._client:
             return
         try:
-            if self._notify_started:
-                await self._client.stop_notify(NOTIFY_CHAR)
+            await self._client.stop_notify(NOTIFY_CHAR)
         except Exception:
             pass
         try:
@@ -103,7 +113,6 @@ class ProfterHeaterBLE:
         except Exception:
             pass
         self._client = None
-        self._notify_started = False
 
     async def _ensure(self) -> BleakClient:
         if self._client and self._client.is_connected:
@@ -113,85 +122,56 @@ class ProfterHeaterBLE:
         assert self._client is not None
         return self._client
 
-    async def _resubscribe_notify(self) -> None:
-        """BlueZ иногда теряет notify — делаем гарантированное перевключение."""
-        c = await self._ensure()
-        try:
-            await c.stop_notify(NOTIFY_CHAR)
-        except Exception:
-            pass
-        await c.start_notify(NOTIFY_CHAR, self._notify_cb)
-        self._notify_started = True
-
-    async def _write8(self, payload: bytes) -> None:
-        c = await self._ensure()
-        await c.write_gatt_char(WRITE_CHAR, payload, response=True)
-
-    async def _poll52_once(self, timeout: float) -> Parsed:
-        c = await self._ensure()
-        self._got_evt.clear()
-        await c.write_gatt_char(WRITE_CHAR, POLL52, response=True)
-        try:
-            await asyncio.wait_for(self._got_evt.wait(), timeout=timeout)
-        except asyncio.TimeoutError:
-            pass
-        return self._last
-
-    async def poll_status(self, timeout: float = 4.0) -> Parsed:
+    async def poll_status(self, timeout: float = 5.0) -> Parsed:
         async with self._lock:
-            await self._ensure()
+            c = await self._ensure()
+            self._got_evt.clear()
 
-            # 1) перевключить notify (лечит "подписка есть, данных нет")
-            await self._resubscribe_notify()
+            # 1) сначала попробуем READ (у notify-char есть read)
+            try:
+                b = await c.read_gatt_char(NOTIFY_CHAR)
+                if isinstance(b, (bytes, bytearray)) and len(b) == 52:
+                    self._last.raw52 = bytes(b)
+                    self._last.is_on = parse_onoff_from_status52(self._last.raw52)
+                    self._last.room_c, self._last.heater_c = parse_temps_best_effort(self._last.raw52)
+                    return self._last
+            except Exception:
+                pass
 
-            # 2) попытка poll
-            p = await self._poll52_once(timeout=timeout)
-            if p.raw52:
-                return p
+            # 2) затем 2-3 раза POLL + ожидание notify
+            for _ in range(3):
+                self._got_evt.clear()
+                try:
+                    await c.write_gatt_char(WRITE_CHAR, POLL52, response=True)
+                except Exception:
+                    # если write упал — переподключимся
+                    await self.disconnect()
+                    c = await self._ensure()
+                    await c.write_gatt_char(WRITE_CHAR, POLL52, response=True)
 
-            # 3) fallback: keepalive + повтор poll (лечит "устройство спит")
-            await self._write8(KEEPALIVE_A)
-            await asyncio.sleep(0.2)
-            await self._write8(KEEPALIVE_B)
-            await asyncio.sleep(0.2)
+                try:
+                    await asyncio.wait_for(self._got_evt.wait(), timeout=timeout / 3)
+                    return self._last
+                except asyncio.TimeoutError:
+                    # на некоторых девайсах помогает небольшой интервал
+                    await asyncio.sleep(0.25)
 
-            await self._resubscribe_notify()
-            return await self._poll52_once(timeout=timeout)
+            return self._last
 
-    async def set_on(self, on: bool, timeout: float = 5.0) -> Parsed:
+    async def set_on(self, on: bool, timeout: float = 6.0) -> Parsed:
         async with self._lock:
-            await self._ensure()
-            await self._resubscribe_notify()
+            c = await self._ensure()
 
             cmd = CMD_ON if on else CMD_OFF
             self._got_evt.clear()
-            await self._client.write_gatt_char(WRITE_CHAR, cmd, response=True)  # type: ignore[union-attr]
+
+            # 1) отправляем команду
+            await c.write_gatt_char(WRITE_CHAR, cmd, response=True)
+
+            # 2) ждём чуть-чуть (как ты уже делал в CLI)
             await asyncio.sleep(0.25)
 
-            # после команды — обязательно poll
-            p = await self._poll52_once(timeout=timeout)
-            if p.raw52:
-                return p
+            # 3) опрашиваем статус устойчивым методом (read + poll)
+            await self.poll_status(timeout=timeout)
 
-            # fallback keepalive + poll
-            await self._write8(KEEPALIVE_A)
-            await asyncio.sleep(0.2)
-            await self._write8(KEEPALIVE_B)
-            await asyncio.sleep(0.2)
-            await self._resubscribe_notify()
-            return await self._poll52_once(timeout=timeout)
-
-    async def async_can_connect(_hass, address: str) -> tuple[bool, str | None]:
-        """Проверка на этапе config_flow: видим ли девайс и можем ли подключиться."""
-        try:
-            dev = await _find_device(address, timeout=6.0)
-            if not dev:
-                return False, "not_found"
-
-            async with BleakClient(dev) as c:
-                if not c.is_connected:
-                    return False, "cannot_connect"
-
-            return True, None
-        except Exception:
-            return False, "cannot_connect"
+            return self._last
