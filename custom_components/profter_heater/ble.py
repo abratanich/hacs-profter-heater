@@ -177,8 +177,7 @@ class ProfterHeaterBLE:
             # 2) then POLL and wait for notify
             for _ in range(3):
                 self._evt.clear()
-                await c.write_gatt_char(WRITE_CHAR, POLL52, response=False)
-                await asyncio.sleep(0.05)  # короткая пауза помогает некоторым устройствам
+                await c.write_gatt_char(WRITE_CHAR, POLL52, response=True)
                 try:
                     await asyncio.wait_for(self._evt.wait(), timeout=timeout / 3)
                     return self._last
@@ -186,16 +185,6 @@ class ProfterHeaterBLE:
                     await asyncio.sleep(0.25)
                 except asyncio.CancelledError:
                     return self._last
-
-            await self.disconnect()
-            c = await self._ensure()
-
-            self._evt.clear()
-            await c.write_gatt_char(WRITE_CHAR, POLL52, response=False)
-            try:
-                await asyncio.wait_for(self._evt.wait(), timeout=timeout / 2)
-            except asyncio.TimeoutError:
-                pass
 
             return self._last
 
@@ -205,9 +194,11 @@ class ProfterHeaterBLE:
             cmd = CMD_ON if on else CMD_OFF
 
             self._evt.clear()
-            await c.write_gatt_char(WRITE_CHAR, cmd, response=False)
+            await c.write_gatt_char(WRITE_CHAR, cmd, response=True)
             await asyncio.sleep(0.25)
-            await c.write_gatt_char(WRITE_CHAR, POLL52, response=False)
+
+            # force fresh status
+            await c.write_gatt_char(WRITE_CHAR, POLL52, response=True)
 
             try:
                 await asyncio.wait_for(self._evt.wait(), timeout=timeout)
