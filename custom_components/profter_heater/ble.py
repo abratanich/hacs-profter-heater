@@ -37,12 +37,15 @@ def _find_marker(p: bytes) -> int:
             return i
     return -1
 
+
+SYNC = b"\xA5\x05\x09\x15"
+
 def parse_onoff_from_status52(p: bytes) -> Optional[bool]:
     if len(p) != 52:
         return None
 
-    i = _find_marker(p)  # ищем просто A5 05
-    if i < 0 or i + 6 > len(p):
+    i = p.find(SYNC)
+    if i == -1 or i + 6 > len(p):
         return None
 
     b1 = p[i + 4]
@@ -55,34 +58,22 @@ def parse_onoff_from_status52(p: bytes) -> Optional[bool]:
 
     return None
 
-# SYNC = b"\xA5\x05\x09\x15"
-#
-# def parse_onoff_from_status52(p: bytes) -> Optional[bool]:
-#     if len(p) != 52:
-#         return None
-#
-#     i = p.find(SYNC)
-#     if i == -1 or i + 6 > len(p):
-#         return None
-#
-#     b1 = p[i + 4]
-#     b2 = p[i + 5]
-#
-#     if (b1, b2) == (0x01, 0x73):
-#         return True
-#     if (b1, b2) == (0x02, 0xEF):
-#         return False
-#
-#     return None
-
 
 def parse_temps_best_effort(p: bytes) -> Tuple[Optional[float], Optional[float]]:
+    """Parse temperatures from known offsets.
+
+    Based on captured 52-byte frames:
+      - heater temp appears as int16 LE at offset 12, scaled by 0.1°C (e.g. 0x0320=800 => 80.0°C)
+      - room temp appears as int16 LE at offset 14, scaled by 0.1°C (e.g. 0x00CA=202 => 20.2°C)
+
+    If values fall outside sane ranges, return None.
+    """
     if len(p) != 52:
         return (None, None)
 
     try:
-        room = struct.unpack_from("<h", p, 14)[0] / 10.0
         heater = struct.unpack_from("<h", p, 16)[0] / 10.0
+        room = struct.unpack_from("<h", p, 14)[0] / 10.0
     except struct.error:
         return (None, None)
 
@@ -90,7 +81,6 @@ def parse_temps_best_effort(p: bytes) -> Tuple[Optional[float], Optional[float]]
         room = None
     if not (-40.0 <= heater <= 250.0):
         heater = None
-
     return (room, heater)
 
 
@@ -113,148 +103,108 @@ class ProfterHeaterBLE:
     def __init__(self, hass, address: str) -> None:
         self._hass = hass
         self._address = address
+        self._client: BleakClient | None = None
         self._lock = asyncio.Lock()
         self._last = Parsed()
+        self._evt = asyncio.Event()
 
     @property
     def last(self) -> Parsed:
         return self._last
 
-    def _parse_52(self, b: bytes) -> None:
+    # Bleak requires a *sync* callback for notifications.
+    def _notification_cb(self, _handle: int, data: bytearray) -> None:
+        b = bytes(data)
+        if len(b) != 52:
+            return
         self._last.raw52 = b
         self._last.is_on = parse_onoff_from_status52(b)
         self._last.room_c, self._last.heater_c = parse_temps_best_effort(b)
+        self._evt.set()
 
-    async def _connect(self) -> BleakClient:
-        ble_device = bluetooth.async_ble_device_from_address(
-            self._hass, self._address, connectable=True
-        )
+    async def connect(self) -> None:
+        ble_device = bluetooth.async_ble_device_from_address(self._hass, self._address, connectable=True)
         if ble_device is None:
             raise BleakNotFoundError(f"{DOMAIN}: Device not found: {self._address}")
 
-        client = await establish_connection(
+        # bleak-retry-connector expects a *client class*, not an instance
+        self._client = await establish_connection(
             BleakClient,
             ble_device,
             self._address,
             max_attempts=3,
         )
-        return client
+
+        await self._client.start_notify(NOTIFY_CHAR, self._notification_cb)
 
     async def disconnect(self) -> None:
-        # оставляем для coordinator.async_shutdown(), но тут делать нечего
-        return
+        if not self._client:
+            return
+        try:
+            await self._client.stop_notify(NOTIFY_CHAR)
+        except Exception:
+            pass
+        try:
+            await self._client.disconnect()
+        except Exception:
+            pass
+        self._client = None
+
+    async def _ensure(self) -> BleakClient:
+        if self._client and self._client.is_connected:
+            return self._client
+        await self.disconnect()
+        await self.connect()
+        assert self._client is not None
+        return self._client
 
     async def poll_status(self, timeout: float = 6.0) -> Parsed:
         async with self._lock:
-            evt = asyncio.Event()
+            c = await self._ensure()
 
-            def cb(_handle: int, data: bytearray) -> None:
-                b = bytes(data)
-                if len(b) == 52:
-                    self._parse_52(b)
-                    evt.set()
-
-            client: BleakClient | None = None
+            # 1) try READ first (notify characteristic also has read)
             try:
-                client = await self._connect()
+                b = await c.read_gatt_char(NOTIFY_CHAR)
+                if isinstance(b, (bytes, bytearray)) and len(b) == 52:
+                    b = bytes(b)
+                    self._last.raw52 = b
+                    self._last.is_on = parse_onoff_from_status52(b)
+                    self._last.room_c, self._last.heater_c = parse_temps_best_effort(b)
+                    return self._last
+            except Exception:
+                pass
 
-                # 1) пробуем READ (если реально поддерживается)
+            # 2) then POLL and wait for notify
+            for _ in range(3):
+                self._evt.clear()
+                await c.write_gatt_char(WRITE_CHAR, POLL52, response=True)
                 try:
-                    b = await client.read_gatt_char(NOTIFY_CHAR)
-                    if isinstance(b, (bytes, bytearray)) and len(b) == 52:
-                        self._parse_52(bytes(b))
-                        return self._last
-                except Exception:
-                    pass
+                    await asyncio.wait_for(self._evt.wait(), timeout=timeout / 3)
+                    return self._last
+                except asyncio.TimeoutError:
+                    await asyncio.sleep(0.25)
+                except asyncio.CancelledError:
+                    return self._last
 
-                # 2) подписка + POLL
-                await client.start_notify(NOTIFY_CHAR, cb)
-
-                slice_t = max(0.7, timeout / 5)
-
-                await client.write_gatt_char(WRITE_CHAR, POLL52, response=True)
-                await asyncio.sleep(0.15)
-
-                for _ in range(5):
-                    evt.clear()
-                    await client.write_gatt_char(WRITE_CHAR, POLL52, response=True)
-                    try:
-                        await asyncio.wait_for(evt.wait(), timeout=slice_t)
-                        return self._last
-                    except asyncio.TimeoutError:
-                        await asyncio.sleep(0.25)
-                    except asyncio.CancelledError:
-                        return self._last
-
-                return self._last
-
-            finally:
-                if client:
-                    try:
-                        await client.stop_notify(NOTIFY_CHAR)
-                    except Exception:
-                        pass
-                    try:
-                        await client.disconnect()
-                    except Exception:
-                        pass
+            return self._last
 
     async def set_on(self, on: bool, timeout: float = 6.0) -> Parsed:
         async with self._lock:
-            evt = asyncio.Event()
-
-            def cb(_handle: int, data: bytearray) -> None:
-                b = bytes(data)
-                if len(b) == 52:
-                    self._parse_52(b)
-                    evt.set()
-
+            c = await self._ensure()
             cmd = CMD_ON if on else CMD_OFF
-            client: BleakClient | None = None
+
+            self._evt.clear()
+            await c.write_gatt_char(WRITE_CHAR, cmd, response=True)
+            await asyncio.sleep(0.25)
+
+            # force fresh status
+            await c.write_gatt_char(WRITE_CHAR, POLL52, response=True)
 
             try:
-                client = await self._connect()
-                await client.start_notify(NOTIFY_CHAR, cb)
+                await asyncio.wait_for(self._evt.wait(), timeout=timeout)
+            except asyncio.TimeoutError:
+                pass
+            except asyncio.CancelledError:
+                pass
 
-                # 1) отправляем команду
-                await client.write_gatt_char(WRITE_CHAR, cmd, response=True)
-                await asyncio.sleep(0.35)
-
-                evt.clear()
-                await client.write_gatt_char(WRITE_CHAR, POLL52, response=True)
-                try:
-                    await asyncio.wait_for(evt.wait(), timeout=0.7)
-                except Exception:
-                    pass
-                # 2) добиваемся нужного статуса
-                deadline = asyncio.get_running_loop().time() + timeout
-                last = self._last
-
-                while asyncio.get_running_loop().time() < deadline:
-                    evt.clear()
-                    await client.write_gatt_char(WRITE_CHAR, POLL52, response=True)
-                    try:
-                        await asyncio.wait_for(evt.wait(), timeout=0.7)
-                    except asyncio.TimeoutError:
-                        continue
-                    except asyncio.CancelledError:
-                        return self._last
-
-                    last = self._last
-                    if last.is_on is not None and last.is_on == on:
-                        return last
-
-                    await asyncio.sleep(0.25)
-
-                return last
-
-            finally:
-                if client:
-                    try:
-                        await client.stop_notify(NOTIFY_CHAR)
-                    except Exception:
-                        pass
-                    try:
-                        await client.disconnect()
-                    except Exception:
-                        pass
+            return self._last
