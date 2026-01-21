@@ -177,7 +177,8 @@ class ProfterHeaterBLE:
             # 2) then POLL and wait for notify
             for _ in range(3):
                 self._evt.clear()
-                await c.write_gatt_char(WRITE_CHAR, POLL52, response=True)
+                await c.write_gatt_char(WRITE_CHAR, POLL52, response=False)
+                await asyncio.sleep(0.05)  # короткая пауза помогает некоторым устройствам
                 try:
                     await asyncio.wait_for(self._evt.wait(), timeout=timeout / 3)
                     return self._last

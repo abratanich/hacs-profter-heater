@@ -33,7 +33,6 @@ class ProfterHeaterCoordinator(DataUpdateCoordinator[Parsed]):
         )
 
     async def _async_update_data(self) -> Parsed:
-        _LOGGER.warning("TICK coordinator poll_status()")
         try:
             return await self.ble.poll_status(timeout=6.0)
         except Exception as e:
