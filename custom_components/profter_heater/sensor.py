@@ -55,7 +55,7 @@ class HeaterRoomTempSensor(_Base):
     _attr_enabled_by_default = True
 
     def __init__(self, coordinator, entry):
-        super().__init__(coordinator, entry, "room_temp", "Room Temperature")
+        super().__init__(coordinator, entry, "room_temp", "Room")
 
     @property
     def native_value(self):
@@ -69,7 +69,7 @@ class HeaterCoreTempSensor(_Base):
     _attr_enabled_by_default = True
 
     def __init__(self, coordinator, entry):
-        super().__init__(coordinator, entry, "heater_temp", "Heater Temperature")
+        super().__init__(coordinator, entry, "heater_temp", "Heater")
 
     @property
     def native_value(self):

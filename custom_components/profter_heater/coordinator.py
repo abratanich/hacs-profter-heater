@@ -17,8 +17,12 @@ class ProfterHeaterCoordinator(DataUpdateCoordinator[Parsed]):
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
         self.entry = entry
         self.address: str = entry.data[CONF_ADDRESS]
-        poll = int(entry.data.get(CONF_POLL_INTERVAL, DEFAULT_POLL_INTERVAL))
-
+        poll = int(
+            entry.options.get(
+                CONF_POLL_INTERVAL,
+                entry.data.get(CONF_POLL_INTERVAL, DEFAULT_POLL_INTERVAL),
+            )
+        )
         self.ble = ProfterHeaterBLE(hass, self.address)
 
         super().__init__(
