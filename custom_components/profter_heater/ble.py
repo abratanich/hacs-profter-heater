@@ -38,17 +38,24 @@ def _find_marker(p: bytes) -> int:
     return -1
 
 
+SYNC = b"\xA5\x05\x09\x15"
+
 def parse_onoff_from_status52(p: bytes) -> Optional[bool]:
     if len(p) != 52:
         return None
-    i = _find_marker(p)
-    if i < 0:
+
+    i = p.find(SYNC)
+    if i == -1 or i + 6 > len(p):
         return None
-    b1, b2 = p[i + 4], p[i + 5]
+
+    b1 = p[i + 4]
+    b2 = p[i + 5]
+
     if (b1, b2) == (0x01, 0x73):
         return True
     if (b1, b2) == (0x02, 0xEF):
         return False
+
     return None
 
 
