@@ -12,14 +12,12 @@ PLATFORMS: list[str] = ["switch", "sensor"]
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     coordinator = ProfterHeaterCoordinator(hass, entry)
 
-    hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
+    # ВАЖНО: принудительный listener, чтобы update_interval всегда работал
+    entry.async_on_unload(coordinator.async_add_listener(lambda: None))
 
-    # Сначала создаём entities (они подпишутся на coordinator)
-    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
-
-    # Потом первый refresh — и сразу же запустится update_interval
     await coordinator.async_config_entry_first_refresh()
-
+    hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     return True
 
 
