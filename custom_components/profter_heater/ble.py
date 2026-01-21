@@ -82,8 +82,8 @@ async def async_can_connect(hass, address: str) -> tuple[bool, Optional[str]]:
         ble_device = bluetooth.async_ble_device_from_address(hass, address, connectable=True)
         if ble_device is None:
             return False, "not_found"
-        client = BleakClient(ble_device)
-        await establish_connection(client, ble_device, address, max_attempts=2)
+        # bleak-retry-connector expects a *client class*, not an instance
+        client = await establish_connection(BleakClient, ble_device, address, max_attempts=2)
         await client.disconnect()
         return True, None
     except BleakNotFoundError:
@@ -105,7 +105,8 @@ class ProfterHeaterBLE:
     def last(self) -> Parsed:
         return self._last
 
-    async def _notification_cb(self, _handle: int, data: bytearray) -> None:
+    # Bleak requires a *sync* callback for notifications.
+    def _notification_cb(self, _handle: int, data: bytearray) -> None:
         b = bytes(data)
         if len(b) != 52:
             return
@@ -119,9 +120,13 @@ class ProfterHeaterBLE:
         if ble_device is None:
             raise BleakNotFoundError(f"{DOMAIN}: Device not found: {self._address}")
 
-        client = BleakClient(ble_device)
-        await establish_connection(client, ble_device, self._address, max_attempts=3)
-        self._client = client
+        # bleak-retry-connector expects a *client class*, not an instance
+        self._client = await establish_connection(
+            BleakClient,
+            ble_device,
+            self._address,
+            max_attempts=3,
+        )
 
         await self._client.start_notify(NOTIFY_CHAR, self._notification_cb)
 
