@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-from homeassistant.components.sensor import SensorEntity
+from homeassistant.components.sensor import SensorEntity, SensorDeviceClass
 from homeassistant.const import UnitOfTemperature
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.helpers.entity import EntityCategory  # <-- ADD
 
 from .const import DOMAIN
 from .coordinator import ProfterHeaterCoordinator
@@ -50,9 +50,9 @@ class HeaterStateSensor(_Base):
 
 class HeaterRoomTempSensor(_Base):
     _attr_native_unit_of_measurement = UnitOfTemperature.CELSIUS
-    _attr_device_class = "temperature"
-    _attr_entity_category = EntityCategory.DIAGNOSTIC  # <-- FIX
-    _attr_enabled_by_default = False
+    _attr_device_class = SensorDeviceClass.TEMPERATURE
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_enabled_by_default = True
 
     def __init__(self, coordinator, entry):
         super().__init__(coordinator, entry, "room_temp", "Room Temperature")
@@ -64,9 +64,9 @@ class HeaterRoomTempSensor(_Base):
 
 class HeaterCoreTempSensor(_Base):
     _attr_native_unit_of_measurement = UnitOfTemperature.CELSIUS
-    _attr_device_class = "temperature"
-    _attr_entity_category = EntityCategory.DIAGNOSTIC  # <-- FIX
-    _attr_enabled_by_default = False
+    _attr_device_class = SensorDeviceClass.TEMPERATURE
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_enabled_by_default = True
 
     def __init__(self, coordinator, entry):
         super().__init__(coordinator, entry, "heater_temp", "Heater Temperature")
@@ -77,7 +77,8 @@ class HeaterCoreTempSensor(_Base):
 
 
 class HeaterRaw52Sensor(_Base):
-    _attr_entity_category = EntityCategory.DIAGNOSTIC  # <-- FIX
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_enabled_by_default = False
 
     def __init__(self, coordinator, entry):
         super().__init__(coordinator, entry, "raw52", "Raw Status 52")

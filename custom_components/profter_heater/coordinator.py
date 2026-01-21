@@ -16,8 +16,8 @@ _LOGGER = logging.getLogger(__name__)
 class ProfterHeaterCoordinator(DataUpdateCoordinator[Parsed]):
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
         self.entry = entry
-        self.address = entry.data[CONF_ADDRESS]
-        poll = entry.data.get(CONF_POLL_INTERVAL, DEFAULT_POLL_INTERVAL)
+        self.address: str = entry.data[CONF_ADDRESS]
+        poll = int(entry.data.get(CONF_POLL_INTERVAL, DEFAULT_POLL_INTERVAL))
 
         self.ble = ProfterHeaterBLE(hass, self.address)
 
@@ -25,12 +25,12 @@ class ProfterHeaterCoordinator(DataUpdateCoordinator[Parsed]):
             hass,
             logger=_LOGGER,
             name=f"{DOMAIN}_{self.address}",
-            update_interval=timedelta(seconds=int(poll)),
+            update_interval=timedelta(seconds=poll),
         )
 
     async def _async_update_data(self) -> Parsed:
         try:
-            return await self.ble.poll_status(timeout=3.0)
+            return await self.ble.poll_status(timeout=6.0)
         except Exception as e:
             raise UpdateFailed(str(e)) from e
 
@@ -38,5 +38,5 @@ class ProfterHeaterCoordinator(DataUpdateCoordinator[Parsed]):
         await self.ble.disconnect()
 
     async def async_set_power(self, on: bool) -> None:
-        await self.ble.set_on(on, timeout=4.0)
+        await self.ble.set_on(on, timeout=6.0)
         await self.async_request_refresh()

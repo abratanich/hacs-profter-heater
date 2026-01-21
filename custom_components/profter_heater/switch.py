@@ -10,11 +10,7 @@ from .const import DOMAIN
 from .coordinator import ProfterHeaterCoordinator
 
 
-async def async_setup_entry(
-    hass: HomeAssistant,
-    entry: ConfigEntry,
-    async_add_entities: AddEntitiesCallback,
-) -> None:
+async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback) -> None:
     coordinator: ProfterHeaterCoordinator = hass.data[DOMAIN][entry.entry_id]
     async_add_entities([ProfterHeaterSwitch(coordinator, entry)])
 
@@ -22,7 +18,6 @@ async def async_setup_entry(
 class ProfterHeaterSwitch(CoordinatorEntity[ProfterHeaterCoordinator], SwitchEntity):
     _attr_has_entity_name = True
     _attr_name = "Heater"
-    _attr_icon = "mdi:radiator"
 
     def __init__(self, coordinator: ProfterHeaterCoordinator, entry: ConfigEntry) -> None:
         super().__init__(coordinator)
@@ -35,12 +30,8 @@ class ProfterHeaterSwitch(CoordinatorEntity[ProfterHeaterCoordinator], SwitchEnt
         }
 
     @property
-    def is_on(self) -> bool:
-        return self.coordinator.data.is_on is True
-
-    @property
-    def available(self) -> bool:
-        return self.coordinator.last_update_success
+    def is_on(self):
+        return bool(self.coordinator.data.is_on) if self.coordinator.data.is_on is not None else False
 
     async def async_turn_on(self, **kwargs) -> None:
         await self.coordinator.async_set_power(True)

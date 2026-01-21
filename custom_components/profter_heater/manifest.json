@@ -1,10 +1,13 @@
 {
   "domain": "profter_heater",
-  "name": "Profter Heater BLE",
-  "version": "0.1.0",
-  "config_flow": true,
-  "documentation": "https://github.com/abratanich/hacs-profter-heater",
+  "name": "Profter Heater (BLE)",
+  "version": "0.2.0",
+  "documentation": "https://github.com/abratanich/profter_heater",
   "requirements": [],
-  "dependencies": ["bluetooth"],
-  "codeowners": []
+  "dependencies": [
+    "bluetooth"
+  ],
+  "codeowners": [],
+  "config_flow": true,
+  "iot_class": "local_polling"
 }

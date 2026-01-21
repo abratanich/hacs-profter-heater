@@ -2,17 +2,17 @@
   "config": {
     "step": {
       "user": {
-        "title": "Add Profter Heater",
-        "description": "Enter BLE address/UUID",
+        "title": "Profter Heater",
+        "description": "Set up Profter Heater over BLE.",
         "data": {
-          "address": "BLE address/UUID",
-          "poll_interval": "Poll interval (seconds)"
+          "address": "BLE MAC address (e.g. C1:02:B3:E1:FE:0C)",
+          "poll_interval": "Poll interval, seconds"
         }
       }
     },
     "error": {
-      "cannot_connect": "Cannot connect",
-      "not_found": "Device not found"
+      "not_found": "Device not found",
+      "cannot_connect": "Cannot connect"
     }
   }
 }
