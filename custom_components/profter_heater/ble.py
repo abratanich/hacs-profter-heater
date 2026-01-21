@@ -203,11 +203,12 @@ class ProfterHeaterBLE:
                 while asyncio.get_running_loop().time() < deadline:
                     evt.clear()
                     await client.write_gatt_char(WRITE_CHAR, POLL52, response=True)
-
                     try:
                         await asyncio.wait_for(evt.wait(), timeout=0.7)
                     except asyncio.TimeoutError:
                         continue
+                    except asyncio.CancelledError:
+                        return self._last
 
                     last = self._last
                     if last.is_on is not None and last.is_on == on:
