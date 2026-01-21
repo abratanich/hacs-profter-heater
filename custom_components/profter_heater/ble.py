@@ -153,14 +153,18 @@ class ProfterHeaterBLE:
                 # 2) подписка + POLL
                 await client.start_notify(NOTIFY_CHAR, cb)
 
-                for _ in range(3):
+                slice_t = max(0.7, timeout / 5)
+
+                for _ in range(5):
                     evt.clear()
                     await client.write_gatt_char(WRITE_CHAR, POLL52, response=True)
                     try:
-                        await asyncio.wait_for(evt.wait(), timeout=timeout / 3)
+                        await asyncio.wait_for(evt.wait(), timeout=slice_t)
                         return self._last
                     except asyncio.TimeoutError:
                         await asyncio.sleep(0.25)
+                    except asyncio.CancelledError:
+                        return self._last
 
                 return self._last
 
@@ -196,6 +200,12 @@ class ProfterHeaterBLE:
                 await client.write_gatt_char(WRITE_CHAR, cmd, response=True)
                 await asyncio.sleep(0.35)
 
+                evt.clear()
+                await client.write_gatt_char(WRITE_CHAR, POLL52, response=True)
+                try:
+                    await asyncio.wait_for(evt.wait(), timeout=0.7)
+                except Exception:
+                    pass
                 # 2) добиваемся нужного статуса
                 deadline = asyncio.get_running_loop().time() + timeout
                 last = self._last
