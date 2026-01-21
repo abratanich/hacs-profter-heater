@@ -37,15 +37,12 @@ def _find_marker(p: bytes) -> int:
             return i
     return -1
 
-
-SYNC = b"\xA5\x05\x09\x15"
-
 def parse_onoff_from_status52(p: bytes) -> Optional[bool]:
     if len(p) != 52:
         return None
 
-    i = p.find(SYNC)
-    if i == -1 or i + 6 > len(p):
+    i = _find_marker(p)  # ищем просто A5 05
+    if i < 0 or i + 6 > len(p):
         return None
 
     b1 = p[i + 4]
@@ -57,6 +54,26 @@ def parse_onoff_from_status52(p: bytes) -> Optional[bool]:
         return False
 
     return None
+
+# SYNC = b"\xA5\x05\x09\x15"
+#
+# def parse_onoff_from_status52(p: bytes) -> Optional[bool]:
+#     if len(p) != 52:
+#         return None
+#
+#     i = p.find(SYNC)
+#     if i == -1 or i + 6 > len(p):
+#         return None
+#
+#     b1 = p[i + 4]
+#     b2 = p[i + 5]
+#
+#     if (b1, b2) == (0x01, 0x73):
+#         return True
+#     if (b1, b2) == (0x02, 0xEF):
+#         return False
+#
+#     return None
 
 
 def parse_temps_best_effort(p: bytes) -> Tuple[Optional[float], Optional[float]]:
@@ -154,6 +171,9 @@ class ProfterHeaterBLE:
                 await client.start_notify(NOTIFY_CHAR, cb)
 
                 slice_t = max(0.7, timeout / 5)
+
+                await client.write_gatt_char(WRITE_CHAR, POLL52, response=True)
+                await asyncio.sleep(0.15)
 
                 for _ in range(5):
                     evt.clear()
