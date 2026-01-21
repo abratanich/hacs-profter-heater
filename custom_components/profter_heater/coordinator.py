@@ -33,9 +33,16 @@ class ProfterHeaterCoordinator(DataUpdateCoordinator[Parsed]):
         )
 
     async def _async_update_data(self) -> Parsed:
+        _LOGGER.debug("TICK poll_status() %s", self.address)
         try:
-            return await self.ble.poll_status(timeout=6.0)
+            data = await self.ble.poll_status(timeout=6.0)
+            _LOGGER.debug(
+                "GOT %s on=%s room=%s heater=%s",
+                self.address, data.is_on, data.room_c, data.heater_c
+            )
+            return data
         except Exception as e:
+            _LOGGER.exception("poll_status failed for %s: %s", self.address, e)
             raise UpdateFailed(str(e)) from e
 
     async def async_shutdown(self) -> None:

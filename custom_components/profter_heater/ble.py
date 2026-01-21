@@ -187,6 +187,16 @@ class ProfterHeaterBLE:
                 except asyncio.CancelledError:
                     return self._last
 
+            await self.disconnect()
+            c = await self._ensure()
+
+            self._evt.clear()
+            await c.write_gatt_char(WRITE_CHAR, POLL52, response=False)
+            try:
+                await asyncio.wait_for(self._evt.wait(), timeout=timeout / 2)
+            except asyncio.TimeoutError:
+                pass
+
             return self._last
 
     async def set_on(self, on: bool, timeout: float = 6.0) -> Parsed:
@@ -195,11 +205,9 @@ class ProfterHeaterBLE:
             cmd = CMD_ON if on else CMD_OFF
 
             self._evt.clear()
-            await c.write_gatt_char(WRITE_CHAR, cmd, response=True)
+            await c.write_gatt_char(WRITE_CHAR, cmd, response=False)
             await asyncio.sleep(0.25)
-
-            # force fresh status
-            await c.write_gatt_char(WRITE_CHAR, POLL52, response=True)
+            await c.write_gatt_char(WRITE_CHAR, POLL52, response=False)
 
             try:
                 await asyncio.wait_for(self._evt.wait(), timeout=timeout)
