@@ -177,38 +177,53 @@ class ProfterHeaterBLE:
 
     async def set_on(self, on: bool, timeout: float = 6.0) -> Parsed:
         async with self._lock:
-            c = await self._ensure()
+            evt = asyncio.Event()
+
+            def cb(_handle: int, data: bytearray) -> None:
+                b = bytes(data)
+                if len(b) == 52:
+                    self._parse_52(b)
+                    evt.set()
+
             cmd = CMD_ON if on else CMD_OFF
+            client: BleakClient | None = None
 
-            # 1) отправляем команду
-            self._evt.clear()
-            await c.write_gatt_char(WRITE_CHAR, cmd, response=True)
+            try:
+                client = await self._connect()
+                await client.start_notify(NOTIFY_CHAR, cb)
 
-            # 2) даём устройству применить команду
-            await asyncio.sleep(0.35)
+                # 1) отправляем команду
+                await client.write_gatt_char(WRITE_CHAR, cmd, response=True)
+                await asyncio.sleep(0.35)
 
-            # 3) добиваемся "статус == on" (несколько POLL + ожидание)
-            deadline = asyncio.get_running_loop().time() + timeout
-            last = self._last
-
-            while asyncio.get_running_loop().time() < deadline:
-                self._evt.clear()
-                await c.write_gatt_char(WRITE_CHAR, POLL52, response=True)
-
-                # ждём кадр (но недолго, чтобы успеть повторить POLL)
-                try:
-                    await asyncio.wait_for(self._evt.wait(), timeout=0.7)
-                except asyncio.TimeoutError:
-                    continue
-                except asyncio.CancelledError:
-                    return self._last
-
+                # 2) добиваемся нужного статуса
+                deadline = asyncio.get_running_loop().time() + timeout
                 last = self._last
-                if last.is_on is not None and last.is_on == on:
-                    return last
 
-                # если пришёл "старый" статус — немного подождём и повторим
-                await asyncio.sleep(0.25)
+                while asyncio.get_running_loop().time() < deadline:
+                    evt.clear()
+                    await client.write_gatt_char(WRITE_CHAR, POLL52, response=True)
 
-            # таймаут: возвращаем, что есть
-            return last
+                    try:
+                        await asyncio.wait_for(evt.wait(), timeout=0.7)
+                    except asyncio.TimeoutError:
+                        continue
+
+                    last = self._last
+                    if last.is_on is not None and last.is_on == on:
+                        return last
+
+                    await asyncio.sleep(0.25)
+
+                return last
+
+            finally:
+                if client:
+                    try:
+                        await client.stop_notify(NOTIFY_CHAR)
+                    except Exception:
+                        pass
+                    try:
+                        await client.disconnect()
+                    except Exception:
+                        pass
