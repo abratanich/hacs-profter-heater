@@ -1,23 +1,16 @@
 from __future__ import annotations
 
 import asyncio
-import logging
 import struct
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
 from bleak import BleakClient
-from bleak_retry_connector import (
-    establish_connection,
-    BleakNotFoundError,
-    BleakConnectionError,
-)
+from bleak_retry_connector import establish_connection, BleakNotFoundError
 
 from homeassistant.components import bluetooth
 
 from .const import WRITE_CHAR, NOTIFY_CHAR, CMD_ON, CMD_OFF, POLL52, DOMAIN
-
-_LOGGER = logging.getLogger(__name__)
 
 
 @dataclass
@@ -29,10 +22,18 @@ class Parsed:
 
 
 def parse_onoff_from_status52(p: bytes) -> Optional[bool]:
+    """Ищем маркер A5 05 ?? ?? b1 b2 и трактуем (b1,b2).
+    В твоих кадрах встречалось:
+      ... A5 05 09 14 01 73 ... -> ON
+      ... A5 05 09 14 02 EF ... -> OFF
+      ... A5 05 09 15 01 73 ... -> ON
+      ... A5 05 09 15 02 EF ... -> OFF
+    """
     if len(p) != 52:
         return None
 
-    for i in range(len(p) - 6):
+    # ищем A5 05, дальше читаем b1,b2 по +4,+5 (как у тебя было)
+    for i in range(0, len(p) - 6):
         if p[i] == 0xA5 and p[i + 1] == 0x05:
             b1 = p[i + 4]
             b2 = p[i + 5]
@@ -44,13 +45,16 @@ def parse_onoff_from_status52(p: bytes) -> Optional[bool]:
 
 
 def parse_temps_best_effort(p: bytes) -> Tuple[Optional[float], Optional[float]]:
+    """Температуры (твой рабочий вариант):
+      room  = int16 LE @ 14 / 10
+      heater= int16 LE @ 16 / 10
+    """
     if len(p) != 52:
         return (None, None)
 
     try:
-        # как у тебя сейчас: room@14, heater@16
-        heater = struct.unpack_from("<h", p, 16)[0] / 10.0
         room = struct.unpack_from("<h", p, 14)[0] / 10.0
+        heater = struct.unpack_from("<h", p, 16)[0] / 10.0
     except struct.error:
         return (None, None)
 
@@ -58,6 +62,7 @@ def parse_temps_best_effort(p: bytes) -> Tuple[Optional[float], Optional[float]]
         room = None
     if not (-40.0 <= heater <= 250.0):
         heater = None
+
     return (room, heater)
 
 
@@ -66,6 +71,7 @@ async def async_can_connect(hass, address: str) -> tuple[bool, Optional[str]]:
         ble_device = bluetooth.async_ble_device_from_address(hass, address, connectable=True)
         if ble_device is None:
             return False, "not_found"
+
         client = await establish_connection(BleakClient, ble_device, address, max_attempts=2)
         await client.disconnect()
         return True, None
@@ -76,187 +82,157 @@ async def async_can_connect(hass, address: str) -> tuple[bool, Optional[str]]:
 
 
 class ProfterHeaterBLE:
-    """
-    Что добавлено, чтобы реально работало в фоне:
-    1) keepalive-таск, который регулярно шлёт POLL (иначе notify может "уснуть", а HA будет видеть UNKNOWN)
-    2) явный start/stop этого таска при connect/disconnect
-    3) обработка "не пришёл notify" -> реконнект и повтор
-    4) защита от "липкого" event: чистим его до и после ожиданий
-    5) логирование для понимания: приходят ли notify и когда рвётся соединение
+    """BLE транспорт с короткими сессиями: connect->notify->write->wait->disconnect.
+
+    Это наиболее устойчиво для устройств, которые:
+      - не пушат статус сами
+      - "залипают" при долгих соединениях
+      - плохо отрабатывают write response=True
     """
 
     def __init__(self, hass, address: str) -> None:
         self._hass = hass
         self._address = address
-
-        self._client: BleakClient | None = None
         self._lock = asyncio.Lock()
-
         self._last = Parsed()
-        self._evt = asyncio.Event()
-
-        self._keepalive_task: asyncio.Task | None = None
-        self._keepalive_interval_s: float = 20.0  # можно вынести в options
 
     @property
     def last(self) -> Parsed:
         return self._last
 
-    def _notification_cb(self, _handle: int, data: bytearray) -> None:
-        b = bytes(data)
-        if len(b) != 52:
-            return
+    def _parse_52(self, b: bytes) -> None:
         self._last.raw52 = b
         self._last.is_on = parse_onoff_from_status52(b)
         self._last.room_c, self._last.heater_c = parse_temps_best_effort(b)
-        # важно: set из callback (sync) — ок
-        self._evt.set()
-
-        _LOGGER.debug(
-            "%s notify: on=%s room=%s heater=%s tail=%s",
-            self._address,
-            self._last.is_on,
-            self._last.room_c,
-            self._last.heater_c,
-            b[-8:].hex(),
-        )
 
     async def _wait_ble_device(self, timeout: float = 10.0):
+        """Ждём пока HA увидит connectable BLEDevice по адресу (иногда бывает None)."""
         end = asyncio.get_running_loop().time() + timeout
         while asyncio.get_running_loop().time() < end:
-            ble_device = bluetooth.async_ble_device_from_address(
-                self._hass, self._address, connectable=True
-            )
+            ble_device = bluetooth.async_ble_device_from_address(self._hass, self._address, connectable=True)
             if ble_device is not None:
                 return ble_device
             await asyncio.sleep(0.5)
         raise BleakNotFoundError(f"{DOMAIN}: Device not found (no adv): {self._address}")
 
-    async def connect(self) -> None:
+    async def _with_client(self):
+        """Контекст короткой сессии."""
         ble_device = await self._wait_ble_device(timeout=10.0)
-
-        self._client = await establish_connection(
+        client = await establish_connection(
             BleakClient,
             ble_device,
             self._address,
             max_attempts=3,
         )
-
-        await self._client.start_notify(NOTIFY_CHAR, self._notification_cb)
-
-        _LOGGER.debug("%s connected + notify started", self._address)
-
-        # запускаем keepalive, чтобы в фоне продолжали обновляться данные
-        self._start_keepalive()
+        return client
 
     async def disconnect(self) -> None:
-        self._stop_keepalive()
-
-        if not self._client:
-            return
-        try:
-            await self._client.stop_notify(NOTIFY_CHAR)
-        except Exception:
-            pass
-        try:
-            await self._client.disconnect()
-        except Exception:
-            pass
-
-        self._client = None
-        _LOGGER.debug("%s disconnected", self._address)
-
-    def _start_keepalive(self) -> None:
-        if self._keepalive_task and not self._keepalive_task.done():
-            return
-        self._keepalive_task = asyncio.create_task(self._keepalive_loop())
-
-    def _stop_keepalive(self) -> None:
-        if self._keepalive_task and not self._keepalive_task.done():
-            self._keepalive_task.cancel()
-        self._keepalive_task = None
-
-    async def _keepalive_loop(self) -> None:
+        """Для совместимости с coordinator.async_shutdown().
+        В коротких сессиях держать глобальное соединение не нужно.
         """
-        Важно: не держим _lock постоянно, чтобы не блокировать set_on().
-        Просто периодически делаем poll_status() — он сам возьмёт lock и обеспечит актуальность.
-        """
-        try:
-            while True:
-                await asyncio.sleep(self._keepalive_interval_s)
-                try:
-                    await self.poll_status(timeout=6.0)
-                except Exception as e:
-                    _LOGGER.debug("%s keepalive poll failed: %r", self._address, e)
-        except asyncio.CancelledError:
-            return
+        return
 
-    async def _ensure(self) -> BleakClient:
-        if self._client and self._client.is_connected:
-            return self._client
-        await self.disconnect()
-        await self.connect()
-        assert self._client is not None
-        return self._client
-
-    async def _poll_once(self, c: BleakClient, timeout: float) -> bool:
-        """
-        Отправить POLL и дождаться notify.
-        Возвращает True если notify пришёл, иначе False.
-        """
-        # обязательно чистим событие ДО poll
-        self._evt.clear()
-
-        # POLL — без response, иначе у некоторых устройств notify "не приходит"
-        await c.write_gatt_char(WRITE_CHAR, POLL52, response=False)
-
-        try:
-            await asyncio.wait_for(self._evt.wait(), timeout=timeout)
-            return True
-        except asyncio.TimeoutError:
-            return False
-        except asyncio.CancelledError:
-            return False
+    async def _poll_once(self, client: BleakClient, evt: asyncio.Event, timeout: float) -> bool:
+        """Отправить POLL и дождаться notify."""
+        evt.clear()
+        # ВАЖНО: response=False для POLL (много устройств ломается на response=True)
+        await client.write_gatt_char(WRITE_CHAR, POLL52, response=False)
+        await asyncio.sleep(0.05)  # маленькая пауза помогает BLE-стекам
+        await asyncio.wait_for(evt.wait(), timeout=timeout)
+        return True
 
     async def poll_status(self, timeout: float = 6.0) -> Parsed:
+        """Периодический опрос из coordinator."""
         async with self._lock:
-            c = await self._ensure()
+            evt = asyncio.Event()
 
-            slice_t = max(0.8, timeout / 3)
+            def cb(_handle: int, data: bytearray) -> None:
+                b = bytes(data)
+                if len(b) == 52:
+                    self._parse_52(b)
+                    evt.set()
 
-            # 3 попытки на живом соединении
-            for attempt in range(3):
-                ok = await self._poll_once(c, timeout=slice_t)
-                if ok:
-                    return self._last
-                _LOGGER.debug("%s poll timeout attempt=%s", self._address, attempt + 1)
-                await asyncio.sleep(0.25)
+            client: BleakClient | None = None
+            try:
+                client = await self._with_client()
+                await client.start_notify(NOTIFY_CHAR, cb)
 
-            # если не пришло — реконнект и последняя попытка
-            _LOGGER.debug("%s poll: reconnect + retry", self._address)
-            await self.disconnect()
-            c = await self._ensure()
+                # 1) пробуем получить кадр несколькими попытками
+                slice_t = max(0.7, timeout / 4)
 
-            ok = await self._poll_once(c, timeout=max(1.2, timeout / 2))
-            return self._last if ok else self._last
+                # Первый POLL сразу
+                for _ in range(4):
+                    try:
+                        await self._poll_once(client, evt, timeout=slice_t)
+                        return self._last
+                    except asyncio.TimeoutError:
+                        # если не ответил — повторяем
+                        await asyncio.sleep(0.25)
+
+                return self._last
+
+            finally:
+                if client:
+                    try:
+                        await client.stop_notify(NOTIFY_CHAR)
+                    except Exception:
+                        pass
+                    try:
+                        await client.disconnect()
+                    except Exception:
+                        pass
 
     async def set_on(self, on: bool, timeout: float = 6.0) -> Parsed:
+        """Команда ON/OFF + подтверждение через статус."""
         async with self._lock:
-            c = await self._ensure()
+            evt = asyncio.Event()
+
+            def cb(_handle: int, data: bytearray) -> None:
+                b = bytes(data)
+                if len(b) == 52:
+                    self._parse_52(b)
+                    evt.set()
+
             cmd = CMD_ON if on else CMD_OFF
 
-            self._evt.clear()
+            client: BleakClient | None = None
+            try:
+                client = await self._with_client()
+                await client.start_notify(NOTIFY_CHAR, cb)
 
-            # команду можно оставлять response=True, но если иногда "зависает" — переведи в False
-            await c.write_gatt_char(WRITE_CHAR, cmd, response=True)
-            await asyncio.sleep(0.25)
+                # 1) отправляем команду (лучше response=False)
+                await client.write_gatt_char(WRITE_CHAR, cmd, response=False)
+                await asyncio.sleep(0.35)
 
-            # добиваемся свежего статуса POLL-ом
-            deadline = asyncio.get_running_loop().time() + timeout
-            while asyncio.get_running_loop().time() < deadline:
-                ok = await self._poll_once(c, timeout=0.8)
-                if ok and self._last.is_on is not None and self._last.is_on == on:
-                    return self._last
-                await asyncio.sleep(0.25)
+                # 2) добиваемся нужного статуса poll'ами до timeout
+                deadline = asyncio.get_running_loop().time() + timeout
+                last = self._last
 
-            return self._last
+                while asyncio.get_running_loop().time() < deadline:
+                    evt.clear()
+                    await client.write_gatt_char(WRITE_CHAR, POLL52, response=False)
+
+                    try:
+                        await asyncio.wait_for(evt.wait(), timeout=0.8)
+                    except asyncio.TimeoutError:
+                        await asyncio.sleep(0.25)
+                        continue
+
+                    last = self._last
+                    if last.is_on is not None and last.is_on == on:
+                        return last
+
+                    await asyncio.sleep(0.25)
+
+                return last
+
+            finally:
+                if client:
+                    try:
+                        await client.stop_notify(NOTIFY_CHAR)
+                    except Exception:
+                        pass
+                    try:
+                        await client.disconnect()
+                    except Exception:
+                        pass

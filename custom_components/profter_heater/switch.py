@@ -18,6 +18,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
 class ProfterHeaterSwitch(CoordinatorEntity[ProfterHeaterCoordinator], SwitchEntity):
     _attr_has_entity_name = True
     _attr_name = "Heater"
+    _attr_icon = "mdi:radiator"
 
     def __init__(self, coordinator: ProfterHeaterCoordinator, entry: ConfigEntry) -> None:
         super().__init__(coordinator)
