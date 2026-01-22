@@ -14,7 +14,7 @@ from homeassistant.components import bluetooth
 from .const import CMD_OFF, CMD_ON, DOMAIN, NOTIFY_CHAR, POLL52, WRITE_CHAR
 
 _LOGGER = logging.getLogger(__name__)
-
+POLL_RESPONSE = False  # можно быстро переключать
 
 @dataclass
 class Parsed:
@@ -82,6 +82,24 @@ def parse_temps_best_effort(p: bytes) -> Tuple[Optional[float], Optional[float]]
 
     return (room, heater)
 
+async def async_can_connect(hass, address: str) -> tuple[bool, Optional[str]]:
+    """Пробна перевірка підключення під час config_flow."""
+    try:
+        ble_device = bluetooth.async_ble_device_from_address(hass, address, connectable=True)
+        if ble_device is None:
+            return False, "not_found"
+
+        client = await establish_connection(BleakClient, ble_device, address, max_attempts=2)
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+        return True, None
+
+    except BleakNotFoundError:
+        return False, "not_found"
+    except Exception:
+        return False, "cannot_connect"
 
 class ProfterHeaterBLE:
     """BLE транспорт с максимально подробным логированием.
@@ -316,7 +334,7 @@ class ProfterHeaterBLE:
             for attempt in range(1, 4):
                 self._evt.clear()
                 try:
-                    await self._write(c, POLL52, response=False, tag=f"POLL52#{attempt}")
+                    await self._write(c, POLL52, response=POLL_RESPONSE, tag=f"POLL52#{attempt}")
                 except Exception as e:
                     _LOGGER.debug("BLE[%s] POLL write failed attempt=%d err=%s", self._address, attempt, e)
                     # Попробуем переподключиться и продолжить
@@ -387,7 +405,7 @@ class ProfterHeaterBLE:
 
                 self._evt.clear()
                 try:
-                    await self._write(c, POLL52, response=False, tag="POLL52(after CMD)")
+                    await self._write(c, POLL52, response=POLL_RESPONSE, tag="POLL52(after CMD)")
                 except Exception as e:
                     _LOGGER.debug("BLE[%s] set_on(%s) POLL write failed: %s", self._address, on, e)
                     await self.disconnect()
