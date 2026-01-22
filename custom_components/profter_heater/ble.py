@@ -1,16 +1,19 @@
+# ble.py
 from __future__ import annotations
 
 import asyncio
+import logging
 import struct
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
 from bleak import BleakClient
-from bleak_retry_connector import establish_connection, BleakNotFoundError
-
+from bleak_retry_connector import BleakNotFoundError, establish_connection
 from homeassistant.components import bluetooth
 
-from .const import WRITE_CHAR, NOTIFY_CHAR, CMD_ON, CMD_OFF, POLL52, DOMAIN
+from .const import CMD_OFF, CMD_ON, DOMAIN, NOTIFY_CHAR, POLL52, WRITE_CHAR
+
+_LOGGER = logging.getLogger(__name__)
 
 
 @dataclass
@@ -21,18 +24,32 @@ class Parsed:
     raw52: Optional[bytes] = None
 
 
+def _hex(b: bytes | bytearray | None, limit: int = 256) -> str:
+    if not b:
+        return ""
+    bb = bytes(b)
+    if len(bb) > limit:
+        return bb[:limit].hex().upper() + f"...(+{len(bb) - limit} bytes)"
+    return bb.hex().upper()
+
+
+def _u16le(p: bytes, off: int) -> int:
+    return struct.unpack_from("<H", p, off)[0]
+
+
+def _s16le(p: bytes, off: int) -> int:
+    return struct.unpack_from("<h", p, off)[0]
+
+
 def parse_onoff_from_status52(p: bytes) -> Optional[bool]:
-    """Ищем маркер A5 05 ?? ?? b1 b2 и трактуем (b1,b2).
-    В твоих кадрах встречалось:
-      ... A5 05 09 14 01 73 ... -> ON
-      ... A5 05 09 14 02 EF ... -> OFF
-      ... A5 05 09 15 01 73 ... -> ON
-      ... A5 05 09 15 02 EF ... -> OFF
+    """Ищем маркер A5 05 ?? ?? b1 b2 .. в хвосте, но допускаем разные варианты.
+    True  -> (b1,b2) == (01,73)
+    False -> (b1,b2) == (02,EF)
     """
     if len(p) != 52:
         return None
 
-    # ищем A5 05, дальше читаем b1,b2 по +4,+5 (как у тебя было)
+    # Ищем любые A5 05 в пакете, дальше смотрим +4/+5
     for i in range(0, len(p) - 6):
         if p[i] == 0xA5 and p[i + 1] == 0x05:
             b1 = p[i + 4]
@@ -45,16 +62,16 @@ def parse_onoff_from_status52(p: bytes) -> Optional[bool]:
 
 
 def parse_temps_best_effort(p: bytes) -> Tuple[Optional[float], Optional[float]]:
-    """Температуры (твой рабочий вариант):
-      room  = int16 LE @ 14 / 10
-      heater= int16 LE @ 16 / 10
+    """Температуры (по твоим наблюдениям):
+    room  -> int16 LE @ 14, scale 0.1°C
+    heater-> int16 LE @ 16, scale 0.1°C
     """
     if len(p) != 52:
         return (None, None)
 
     try:
-        room = struct.unpack_from("<h", p, 14)[0] / 10.0
-        heater = struct.unpack_from("<h", p, 16)[0] / 10.0
+        room = _s16le(p, 14) / 10.0
+        heater = _s16le(p, 16) / 10.0
     except struct.error:
         return (None, None)
 
@@ -66,173 +83,345 @@ def parse_temps_best_effort(p: bytes) -> Tuple[Optional[float], Optional[float]]
     return (room, heater)
 
 
-async def async_can_connect(hass, address: str) -> tuple[bool, Optional[str]]:
-    try:
-        ble_device = bluetooth.async_ble_device_from_address(hass, address, connectable=True)
-        if ble_device is None:
-            return False, "not_found"
-
-        client = await establish_connection(BleakClient, ble_device, address, max_attempts=2)
-        await client.disconnect()
-        return True, None
-    except BleakNotFoundError:
-        return False, "not_found"
-    except Exception:
-        return False, "cannot_connect"
-
-
 class ProfterHeaterBLE:
-    """BLE транспорт с короткими сессиями: connect->notify->write->wait->disconnect.
+    """BLE транспорт с максимально подробным логированием.
 
-    Это наиболее устойчиво для устройств, которые:
-      - не пушат статус сами
-      - "залипают" при долгих соединениях
-      - плохо отрабатывают write response=True
+    Ключевые идеи:
+    - Поддерживаем длительное соединение, но умеем переподключаться.
+    - Статус пытаемся получить так:
+        1) READ NOTIFY_CHAR (если устройство обновляет value)
+        2) POLL52 (write) + ждём notify
+      Если notify не пришёл — не валим интеграцию, возвращаем last.
+    - Любые пришедшие нотификации логируем (длина, hex, попытка парсинга).
     """
 
     def __init__(self, hass, address: str) -> None:
         self._hass = hass
         self._address = address
+
+        self._client: BleakClient | None = None
         self._lock = asyncio.Lock()
+
         self._last = Parsed()
+        self._evt = asyncio.Event()
+
+        self._notify_count = 0
+        self._last_notify_len: Optional[int] = None
 
     @property
     def last(self) -> Parsed:
         return self._last
 
-    def _parse_52(self, b: bytes) -> None:
+    # ---- notify ----
+    def _notification_cb(self, handle: int, data: bytearray) -> None:
+        self._notify_count += 1
+        b = bytes(data)
+        self._last_notify_len = len(b)
+
+        _LOGGER.debug(
+            "BLE[%s] NOTIFY #%d handle=%s len=%d hex=%s",
+            self._address,
+            self._notify_count,
+            handle,
+            len(b),
+            _hex(b),
+        )
+
+        # Логируем попытку распарсить даже если len != 52 — это помогает найти формат
+        if len(b) == 52:
+            self._parse_52(b, src="notify")
+            self._evt.set()
+        else:
+            # иногда устройства шлют куски/фреймы другой длины
+            on = None
+            room = None
+            heater = None
+            try:
+                on = parse_onoff_from_status52(b)  # вернёт None если не 52
+                room, heater = parse_temps_best_effort(b)
+            except Exception:
+                pass
+            _LOGGER.debug(
+                "BLE[%s] NOTIFY(non-52) parsed on=%s room=%s heater=%s",
+                self._address,
+                on,
+                room,
+                heater,
+            )
+
+    def _parse_52(self, b: bytes, src: str) -> None:
         self._last.raw52 = b
         self._last.is_on = parse_onoff_from_status52(b)
         self._last.room_c, self._last.heater_c = parse_temps_best_effort(b)
 
+        # Доп. диагностика: некоторые поля полезно смотреть сырыми
+        try:
+            w14 = _u16le(b, 14)
+            w16 = _u16le(b, 16)
+        except Exception:
+            w14 = None
+            w16 = None
+
+        _LOGGER.debug(
+            "BLE[%s] PARSE52(%s) on=%s room=%s heater=%s off14_u16=%s off16_u16=%s tail=%s",
+            self._address,
+            src,
+            self._last.is_on,
+            self._last.room_c,
+            self._last.heater_c,
+            w14,
+            w16,
+            _hex(b[-16:]),
+        )
+
+    # ---- discovery / connect ----
     async def _wait_ble_device(self, timeout: float = 10.0):
-        """Ждём пока HA увидит connectable BLEDevice по адресу (иногда бывает None)."""
         end = asyncio.get_running_loop().time() + timeout
+        attempt = 0
         while asyncio.get_running_loop().time() < end:
-            ble_device = bluetooth.async_ble_device_from_address(self._hass, self._address, connectable=True)
+            attempt += 1
+            ble_device = bluetooth.async_ble_device_from_address(
+                self._hass, self._address, connectable=True
+            )
             if ble_device is not None:
+                _LOGGER.debug(
+                    "BLE[%s] Found ble_device on attempt=%d: %s",
+                    self._address,
+                    attempt,
+                    ble_device,
+                )
                 return ble_device
+
+            _LOGGER.debug("BLE[%s] Waiting adv... attempt=%d", self._address, attempt)
             await asyncio.sleep(0.5)
+
         raise BleakNotFoundError(f"{DOMAIN}: Device not found (no adv): {self._address}")
 
-    async def _with_client(self):
-        """Контекст короткой сессии."""
+    async def connect(self) -> None:
         ble_device = await self._wait_ble_device(timeout=10.0)
-        client = await establish_connection(
+
+        _LOGGER.debug("BLE[%s] Connecting...", self._address)
+        self._client = await establish_connection(
             BleakClient,
             ble_device,
             self._address,
             max_attempts=3,
         )
-        return client
+        _LOGGER.debug("BLE[%s] Connected: is_connected=%s", self._address, self._client.is_connected)
+
+        # Иногда помогает увеличить MTU (не всегда поддерживается backend-ом)
+        try:
+            if hasattr(self._client, "mtu_size"):
+                _LOGGER.debug("BLE[%s] MTU size=%s", self._address, getattr(self._client, "mtu_size", None))
+        except Exception:
+            pass
+
+        # Подписка на нотификации
+        try:
+            await self._client.start_notify(NOTIFY_CHAR, self._notification_cb)
+            _LOGGER.debug("BLE[%s] start_notify OK char=%s", self._address, NOTIFY_CHAR)
+        except Exception as e:
+            _LOGGER.warning("BLE[%s] start_notify FAILED char=%s err=%s", self._address, NOTIFY_CHAR, e)
+            # Без notify всё равно попробуем работать через READ
+            # но poll_status будет гораздо менее надёжным.
+
+        # Сбросим event на всякий
+        self._evt.clear()
 
     async def disconnect(self) -> None:
-        """Для совместимости с coordinator.async_shutdown().
-        В коротких сессиях держать глобальное соединение не нужно.
-        """
-        return
+        if not self._client:
+            return
 
-    async def _poll_once(self, client: BleakClient, evt: asyncio.Event, timeout: float) -> bool:
-        """Отправить POLL и дождаться notify."""
-        evt.clear()
-        # ВАЖНО: response=False для POLL (много устройств ломается на response=True)
-        await client.write_gatt_char(WRITE_CHAR, POLL52, response=False)
-        await asyncio.sleep(0.05)  # маленькая пауза помогает BLE-стекам
-        await asyncio.wait_for(evt.wait(), timeout=timeout)
-        return True
-
-    async def poll_status(self, timeout: float = 6.0) -> Parsed:
-        """Периодический опрос из coordinator."""
-        async with self._lock:
-            evt = asyncio.Event()
-
-            def cb(_handle: int, data: bytearray) -> None:
-                b = bytes(data)
-                if len(b) == 52:
-                    self._parse_52(b)
-                    evt.set()
-
-            client: BleakClient | None = None
+        _LOGGER.debug("BLE[%s] Disconnecting...", self._address)
+        try:
             try:
-                client = await self._with_client()
-                await client.start_notify(NOTIFY_CHAR, cb)
+                await self._client.stop_notify(NOTIFY_CHAR)
+                _LOGGER.debug("BLE[%s] stop_notify OK", self._address)
+            except Exception as e:
+                _LOGGER.debug("BLE[%s] stop_notify ignored: %s", self._address, e)
 
-                # 1) пробуем получить кадр несколькими попытками
-                slice_t = max(0.7, timeout / 4)
+            await self._client.disconnect()
+            _LOGGER.debug("BLE[%s] Disconnected", self._address)
+        except Exception as e:
+            _LOGGER.debug("BLE[%s] Disconnect exception: %s", self._address, e)
+        finally:
+            self._client = None
 
-                # Первый POLL сразу
-                for _ in range(4):
-                    try:
-                        await self._poll_once(client, evt, timeout=slice_t)
-                        return self._last
-                    except asyncio.TimeoutError:
-                        # если не ответил — повторяем
-                        await asyncio.sleep(0.25)
+    async def _ensure(self) -> BleakClient:
+        if self._client and self._client.is_connected:
+            return self._client
 
+        _LOGGER.debug("BLE[%s] _ensure() reconnect needed", self._address)
+        await self.disconnect()
+        await self.connect()
+        assert self._client is not None
+        return self._client
+
+    # ---- low-level ops ----
+    async def _try_read_status52(self, c: BleakClient) -> bool:
+        """Пробуем прочитать 52 байта через READ."""
+        try:
+            b = await c.read_gatt_char(NOTIFY_CHAR)
+            _LOGGER.debug("BLE[%s] READ char=%s len=%s hex=%s", self._address, NOTIFY_CHAR, len(b), _hex(b))
+            if isinstance(b, (bytes, bytearray)) and len(b) == 52:
+                self._parse_52(bytes(b), src="read")
+                return True
+        except Exception as e:
+            _LOGGER.debug("BLE[%s] READ failed: %s", self._address, e)
+        return False
+
+    async def _write(self, c: BleakClient, payload: bytes, response: bool, tag: str) -> None:
+        _LOGGER.debug(
+            "BLE[%s] WRITE(%s) char=%s response=%s len=%d hex=%s",
+            self._address,
+            tag,
+            WRITE_CHAR,
+            response,
+            len(payload),
+            _hex(payload),
+        )
+        await c.write_gatt_char(WRITE_CHAR, payload, response=response)
+
+    # ---- public API ----
+    async def poll_status(self, timeout: float = 6.0) -> Parsed:
+        """Запросить статус. Не падаем, даже если устройство молчит.
+        Возвращаем self._last (может быть с None полями).
+        """
+        async with self._lock:
+            t0 = asyncio.get_running_loop().time()
+            c = await self._ensure()
+
+            _LOGGER.debug(
+                "BLE[%s] poll_status() begin timeout=%.2f last(on=%s room=%s heater=%s) notify_count=%d last_notify_len=%s",
+                self._address,
+                timeout,
+                self._last.is_on,
+                self._last.room_c,
+                self._last.heater_c,
+                self._notify_count,
+                self._last_notify_len,
+            )
+
+            # 1) READ (многие BLE девайсы обновляют value, даже если notify редкие)
+            if await self._try_read_status52(c):
+                _LOGGER.debug("BLE[%s] poll_status() got via READ in %.3fs", self._address, asyncio.get_running_loop().time() - t0)
                 return self._last
 
-            finally:
-                if client:
-                    try:
-                        await client.stop_notify(NOTIFY_CHAR)
-                    except Exception:
-                        pass
-                    try:
-                        await client.disconnect()
-                    except Exception:
-                        pass
+            # 2) POLL + ждём notify
+            # Некоторые девайсы ломаются от response=True (write-with-response),
+            # другие наоборот требуют response=True. Здесь оставляем response=False для POLL,
+            # но логами легко проверить.
+            per_try = max(0.6, timeout / 3)
+
+            for attempt in range(1, 4):
+                self._evt.clear()
+                try:
+                    await self._write(c, POLL52, response=False, tag=f"POLL52#{attempt}")
+                except Exception as e:
+                    _LOGGER.debug("BLE[%s] POLL write failed attempt=%d err=%s", self._address, attempt, e)
+                    # Попробуем переподключиться и продолжить
+                    await self.disconnect()
+                    c = await self._ensure()
+                    continue
+
+                try:
+                    await asyncio.wait_for(self._evt.wait(), timeout=per_try)
+                    _LOGGER.debug("BLE[%s] poll_status() got via NOTIFY attempt=%d in %.3fs", self._address, attempt, asyncio.get_running_loop().time() - t0)
+                    return self._last
+                except asyncio.TimeoutError:
+                    _LOGGER.debug("BLE[%s] poll_status() timeout waiting notify attempt=%d", self._address, attempt)
+                    # Иногда помогает read после poll
+                    if await self._try_read_status52(c):
+                        _LOGGER.debug("BLE[%s] poll_status() got via READ(after POLL) attempt=%d", self._address, attempt)
+                        return self._last
+                    await asyncio.sleep(0.2)
+                except asyncio.CancelledError:
+                    _LOGGER.debug("BLE[%s] poll_status() cancelled", self._address)
+                    return self._last
+
+            _LOGGER.debug("BLE[%s] poll_status() end NO-RESPONSE in %.3fs -> return last", self._address, asyncio.get_running_loop().time() - t0)
+            return self._last
 
     async def set_on(self, on: bool, timeout: float = 6.0) -> Parsed:
-        """Команда ON/OFF + подтверждение через статус."""
+        """Включить/выключить. Делаем:
+        - write CMD (обычно response=True лучше для команд)
+        - затем POLL и ждём notify / read
+        - если статуса нет — optimistic update is_on, чтобы HA не улетал в unavailable
+        """
         async with self._lock:
-            evt = asyncio.Event()
-
-            def cb(_handle: int, data: bytearray) -> None:
-                b = bytes(data)
-                if len(b) == 52:
-                    self._parse_52(b)
-                    evt.set()
-
+            t0 = asyncio.get_running_loop().time()
+            c = await self._ensure()
             cmd = CMD_ON if on else CMD_OFF
 
-            client: BleakClient | None = None
+            _LOGGER.debug("BLE[%s] set_on(%s) begin timeout=%.2f", self._address, on, timeout)
+
+            # 1) отправляем команду
             try:
-                client = await self._with_client()
-                await client.start_notify(NOTIFY_CHAR, cb)
+                self._evt.clear()
+                await self._write(c, cmd, response=True, tag="CMD")
+            except Exception as e:
+                _LOGGER.warning("BLE[%s] set_on(%s) CMD write failed: %s", self._address, on, e)
+                await self.disconnect()
+                c = await self._ensure()
+                # повторим один раз
+                try:
+                    self._evt.clear()
+                    await self._write(c, cmd, response=True, tag="CMD(retry)")
+                except Exception as e2:
+                    _LOGGER.error("BLE[%s] set_on(%s) CMD retry failed: %s", self._address, on, e2)
+                    # optimistic: всё равно отразим желаемое состояние
+                    self._last.is_on = on
+                    return self._last
 
-                # 1) отправляем команду (лучше response=False)
-                await client.write_gatt_char(WRITE_CHAR, cmd, response=False)
-                await asyncio.sleep(0.35)
+            await asyncio.sleep(0.25)
 
-                # 2) добиваемся нужного статуса poll'ами до timeout
-                deadline = asyncio.get_running_loop().time() + timeout
-                last = self._last
+            # 2) форсим свежий статус: POLL и ждём notify/READ
+            deadline = asyncio.get_running_loop().time() + timeout
+            per_wait = 0.8
 
-                while asyncio.get_running_loop().time() < deadline:
-                    evt.clear()
-                    await client.write_gatt_char(WRITE_CHAR, POLL52, response=False)
+            while asyncio.get_running_loop().time() < deadline:
+                # если уже совпало — выходим
+                if self._last.is_on is not None and self._last.is_on == on:
+                    _LOGGER.debug("BLE[%s] set_on(%s) already matched state", self._address, on)
+                    return self._last
 
-                    try:
-                        await asyncio.wait_for(evt.wait(), timeout=0.8)
-                    except asyncio.TimeoutError:
-                        await asyncio.sleep(0.25)
-                        continue
+                self._evt.clear()
+                try:
+                    await self._write(c, POLL52, response=False, tag="POLL52(after CMD)")
+                except Exception as e:
+                    _LOGGER.debug("BLE[%s] set_on(%s) POLL write failed: %s", self._address, on, e)
+                    await self.disconnect()
+                    c = await self._ensure()
+                    continue
 
-                    last = self._last
-                    if last.is_on is not None and last.is_on == on:
-                        return last
+                # ждём notify
+                try:
+                    await asyncio.wait_for(self._evt.wait(), timeout=per_wait)
+                    if self._last.is_on is not None and self._last.is_on == on:
+                        _LOGGER.debug("BLE[%s] set_on(%s) confirmed via NOTIFY in %.3fs", self._address, on, asyncio.get_running_loop().time() - t0)
+                        return self._last
+                except asyncio.TimeoutError:
+                    _LOGGER.debug("BLE[%s] set_on(%s) wait notify timeout, trying READ", self._address, on)
+                    if await self._try_read_status52(c):
+                        if self._last.is_on is not None and self._last.is_on == on:
+                            _LOGGER.debug("BLE[%s] set_on(%s) confirmed via READ in %.3fs", self._address, on, asyncio.get_running_loop().time() - t0)
+                            return self._last
+                except asyncio.CancelledError:
+                    _LOGGER.debug("BLE[%s] set_on(%s) cancelled", self._address, on)
+                    break
 
-                    await asyncio.sleep(0.25)
+                await asyncio.sleep(0.25)
 
-                return last
+            # 3) если не подтвердили — делаем optimistic, чтобы HA не уходил в None/unavailable
+            if self._last.is_on != on:
+                _LOGGER.warning(
+                    "BLE[%s] set_on(%s) NOT CONFIRMED in %.3fs -> optimistic is_on=%s (last was %s)",
+                    self._address,
+                    on,
+                    asyncio.get_running_loop().time() - t0,
+                    on,
+                    self._last.is_on,
+                )
+                self._last.is_on = on
 
-            finally:
-                if client:
-                    try:
-                        await client.stop_notify(NOTIFY_CHAR)
-                    except Exception:
-                        pass
-                    try:
-                        await client.disconnect()
-                    except Exception:
-                        pass
+            return self._last
